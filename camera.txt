@@ -1,0 +1,1089 @@
+//camera.py
+import cv2
+import RPi.GPIO as GPIO
+from picamera2 import Picamera2
+import time
+import os
+import numpy as np
+import subprocess
+
+# GPIO setup
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(17, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(27, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(22, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+# Cameră
+picam2 = Picamera2()
+picam2.start()
+
+# Galerie
+image_folder = "/home/pi/imagini_capturate"
+os.makedirs(image_folder, exist_ok=True)
+current_image_index = 0
+camera_mode = True
+recording = False
+video_writer = None
+start_record_time = 0
+blink_state = True
+last_blink_time = 0
+recording_filename = ""
+last_capture_time = 0
+
+# Accesorii
+accessory_state = 0
+last_button_state = GPIO.HIGH
+last_accessory_time = 0
+
+# Încarcă PNG-uri cu transparență
+hat_img = cv2.imread("/home/pi/palarie-removebg-preview.png", cv2.IMREAD_UNCHANGED)
+mustache_img = cv2.imread("/home/pi/mustata-removebg-preview.png", cv2.IMREAD_UNCHANGED)
+glasses_img = cv2.imread("/home/pi/ochelari-removebg-preview.png", cv2.IMREAD_UNCHANGED)
+
+# Clasificator Haar
+face_cascade = cv2.CascadeClassifier('/home/pi/galerie_pi/venv/lib/python3.11/site-packages/cv2/data/haarcascade_frontalface_default.xml')
+
+def save_image(frame):
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    filename = os.path.join(image_folder, f"captured_{timestamp}.jpg")
+    cv2.imwrite(filename, frame)
+    print(f"Imagine salvată: {filename}")
+    if os.path.exists("/home/pi/camera_click.wav"):
+        subprocess.run(["aplay", "/home/pi/camera_click.wav"])
+    return filename
+
+def start_video_writer():
+    global recording_filename
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    recording_filename = os.path.join(image_folder, f"video_{timestamp}.avi")
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    return cv2.VideoWriter(recording_filename, fourcc, 20.0, (640, 480))
+
+def list_images():
+    return sorted([
+        os.path.join(image_folder, f)
+        for f in os.listdir(image_folder)
+        if f.lower().endswith(".jpg") or f.lower().endswith(".avi")
+    ])
+
+def handle_touch(event, x, y, flags, param):
+    global current_image_index, images, click_x
+    if event == cv2.EVENT_LBUTTONDOWN:
+        click_x = x
+    elif event == cv2.EVENT_LBUTTONUP:
+        dx = x - click_x
+        if dx > 50 and len(images) > 1:
+            current_image_index = (current_image_index - 1) % len(images)
+        elif dx < -50 and len(images) > 1:
+            current_image_index = (current_image_index + 1) % len(images)
+
+def overlay_image_alpha(img, overlay, pos):
+    x, y = pos
+    h, w = overlay.shape[:2]
+    if y + h > img.shape[0] or x + w > img.shape[1] or x < 0 or y < 0:
+        return img
+    alpha = overlay[:, :, 3] / 255.0
+    for c in range(3):
+        img[y:y+h, x:x+w, c] = alpha * overlay[:, :, c] + (1 - alpha) * img[y:y+h, x:x+w, c]
+    return img
+
+try:
+    while True:
+        if not camera_mode and (GPIO.input(17) == GPIO.LOW or GPIO.input(27) == GPIO.LOW):
+            camera_mode = True
+            time.sleep(0.5)
+            cv2.destroyAllWindows()
+        elif camera_mode and GPIO.input(27) == GPIO.LOW:
+            camera_mode = False
+            time.sleep(0.5)
+            cv2.destroyAllWindows()
+
+        if GPIO.input(22) == GPIO.LOW and last_button_state == GPIO.HIGH and time.time() - last_accessory_time > 0.3:
+            accessory_state = (accessory_state + 1) % 4
+            last_accessory_time = time.time()
+        last_button_state = GPIO.input(22)
+
+        if camera_mode:
+            frame = picam2.capture_array()
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            display_frame = frame.copy()
+            frame_to_save = frame.copy()
+
+            gray = cv2.cvtColor(display_frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+
+            for (x, y, w, h) in faces:
+                if accessory_state == 1 and hat_img is not None:
+                    hat_resized = cv2.resize(hat_img, (w, int(h/2)))
+                    display_frame = overlay_image_alpha(display_frame, hat_resized, (x, y - int(h/2)))
+                    frame_to_save = overlay_image_alpha(frame_to_save, hat_resized, (x, y - int(h/2)))
+                elif accessory_state == 2 and mustache_img is not None:
+                    mustache_resized = cv2.resize(mustache_img, (w//2, h//5))
+                    mustache_y = y + int(h * 0.7)
+                    mustache_x = x + int(w * 0.25)
+                    display_frame = overlay_image_alpha(display_frame, mustache_resized, (mustache_x, mustache_y))
+                    frame_to_save = overlay_image_alpha(frame_to_save, mustache_resized, (mustache_x, mustache_y))
+                elif accessory_state == 3 and glasses_img is not None:
+                    glasses_resized = cv2.resize(glasses_img, (w, h//3))
+                    display_frame = overlay_image_alpha(display_frame, glasses_resized, (x, y + h//4))
+                    frame_to_save = overlay_image_alpha(frame_to_save, glasses_resized, (x, y + h//4))
+                elif accessory_state == 0:
+                    # DOAR pe ecran: dreptunghiul de recunoaștere
+                    cv2.rectangle(display_frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+
+            if GPIO.input(17) == GPIO.LOW and not recording:
+                if start_record_time == 0:
+                    start_record_time = time.time()
+                elif time.time() - start_record_time > 2:
+                    recording = True
+                    video_writer = start_video_writer()
+                    print("Înregistrare video pornită.")
+            elif GPIO.input(17) == GPIO.HIGH:
+                if recording:
+                    recording = False
+                    video_writer.release()
+                    print("Înregistrare video oprită.")
+                elif start_record_time > 0 and time.time() - start_record_time <= 2:
+                    save_image(frame_to_save)  # Salvează fără pătrat
+                    last_capture_time = time.time()
+                start_record_time = 0
+
+            if recording:
+                video_writer.write(frame)
+                current_time = time.time()
+                if current_time - last_blink_time > 0.5:
+                    blink_state = not blink_state
+                    last_blink_time = current_time
+                if blink_state:
+                    cv2.putText(display_frame, "REC", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 4)
+
+            if 0 < time.time() - last_capture_time < 1:
+                cv2.putText(display_frame, "Imagine capturata", (10, 460), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+            cv2.namedWindow("Camera", cv2.WND_PROP_FULLSCREEN)
+            cv2.setWindowProperty("Camera", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+            cv2.imshow("Camera", display_frame)
+
+        else:
+            images = list_images()
+            if images:
+                current_path = images[current_image_index]
+                ext = os.path.splitext(current_path)[-1].lower()
+                if ext == ".avi":
+                    cap = cv2.VideoCapture(current_path)
+                    while cap.isOpened():
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+                        cv2.namedWindow("Galerie", cv2.WND_PROP_FULLSCREEN)
+                        cv2.setWindowProperty("Galerie", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                        cv2.imshow("Galerie", frame)
+                        if cv2.waitKey(30) & 0xFF == ord('q'):
+                            break
+                    cap.release()
+                else:
+                    img = cv2.imread(current_path)
+                    cv2.namedWindow("Galerie", cv2.WND_PROP_FULLSCREEN)
+                    cv2.setWindowProperty("Galerie", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                    cv2.setMouseCallback("Galerie", handle_touch)
+                    cv2.imshow("Galerie", img)
+            else:
+                blank = 255 * np.ones((480, 640, 3), dtype=np.uint8)
+                cv2.putText(blank, "Nicio imagine!", (100, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                cv2.namedWindow("Galerie", cv2.WND_PROP_FULLSCREEN)
+                cv2.setWindowProperty("Galerie", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                cv2.imshow("Galerie", blank)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+finally:
+    if video_writer:
+        video_writer.release()
+    cv2.destroyAllWindows()
+    GPIO.cleanup()
+
+//app_web.py
+from flask import Flask, render_template, request, redirect, url_for, send_from_directory
+import paramiko
+import os
+import base64
+from io import BytesIO
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+import json
+import subprocess
+import numpy as np
+
+app = Flask(__name__)
+
+# Setări generale
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB
+UPLOAD_FOLDER = '/home/pi/imagini_capturate'
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+# Config Raspberry Pi
+pi_ip = "192.168.1.142"
+username = "pi"
+password = "raspberry"
+remote_path = "/home/pi/imagini_capturate/"
+local_path = UPLOAD_FOLDER
+
+# Căi pentru fișiere de date
+NUME_PERSOANE_PATH = "nume_persoane.json"
+FACE_DATA_PATH = "face_data.json"
+
+@app.route('/')
+def home():
+    return render_template('index.html')
+
+@app.route('/galerie')
+def galerie():
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(pi_ip, username=username, password=password)
+    sftp = ssh.open_sftp()
+
+    try:
+        file_list = sftp.listdir(remote_path)
+        allowed_ext = ('.jpg', '.jpeg', '.png', '.gif', '.mp4', '.mov', '.avi')
+
+        raw_media = [f for f in file_list if f.lower().endswith(allowed_ext)]
+        media_files = []
+
+        for file in raw_media:
+            if file.lower().endswith(('.mp4', '.mov', '.avi')):  # Verificare și conversie video
+                converted = convert_to_mp4_if_needed(sftp, file)
+                media_files.append(converted)
+            else:  # Imagini
+                local_file = os.path.join(UPLOAD_FOLDER, file)
+                if not os.path.exists(local_file):
+                    sftp.get(os.path.join(remote_path, file), local_file)
+                media_files.append(file)
+
+        media_files = sorted(set(media_files))
+    finally:
+        sftp.close()
+        ssh.close()
+
+    return render_template('galerie.html', media_files=media_files)
+
+def convert_to_mp4_if_needed(sftp, filename):
+    name, ext = os.path.splitext(filename)
+    ext = ext.lower()
+    if ext == ".mp4":
+        return filename
+
+    original_local = os.path.join(UPLOAD_FOLDER, filename)
+    converted_name = f"{name}.mp4"
+    converted_path = os.path.join(UPLOAD_FOLDER, converted_name)
+
+    if os.path.exists(converted_path):
+        return converted_name
+
+    if not os.path.exists(original_local):
+        sftp.get(os.path.join(remote_path, filename), original_local)
+
+    try:
+        subprocess.run(['ffmpeg', '-y', '-i', original_local, converted_path],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"[INFO] Convertit: {filename} → {converted_name}")
+    except subprocess.CalledProcessError:
+        print(f"[EROARE] Conversie eșuată pentru {filename}")
+        return filename
+
+    return converted_name
+
+@app.route('/serve_image/<filename>')
+def serve_image(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+@app.route('/editeaza/<filename>', methods=['GET', 'POST'])
+def editeaza(filename):
+    image_path = os.path.join(local_path, filename)
+    if request.method == 'POST':
+        image_data = request.form.get('image')
+        filters_string = request.form.get('filters', 'sepia')  # Default filter is sepia
+        filters = filters_string.split(',') if filters_string else []
+
+        if image_data:
+            save_edited_image(filename, image_data, filters)
+        return redirect(url_for('galerie'))
+
+    return render_template('editare.html', filename=filename, image_path=image_path)
+
+def save_edited_image(filename, image_data, filters):
+    header, encoded = image_data.split(",", 1)
+    image_data_decoded = base64.b64decode(encoded)
+
+    image = Image.open(BytesIO(image_data_decoded)).convert("RGB")
+    image = apply_filters(image, filters)
+
+    original_image_path = os.path.join(UPLOAD_FOLDER, filename)
+    if not os.path.exists(original_image_path):
+        image.save(original_image_path)
+
+    edited_image_path = os.path.join(UPLOAD_FOLDER, f"edited_{filename}")
+    image.save(edited_image_path)
+
+def apply_filters(image, filters):
+    if 'brightness' in filters:
+        image = ImageEnhance.Brightness(image).enhance(1.4)
+    if 'contrast' in filters:
+        image = ImageEnhance.Contrast(image).enhance(1.4)
+    if 'saturation' in filters:
+        image = ImageEnhance.Color(image).enhance(1.4)
+    if 'sharpness' in filters:
+        image = ImageEnhance.Sharpness(image).enhance(2.0)
+    if 'blur' in filters:
+        image = image.filter(ImageFilter.GaussianBlur(5))
+    if 'sharpen' in filters:
+        image = image.filter(ImageFilter.SHARPEN)
+    if 'invert' in filters:
+        if image.mode != 'RGB': image = image.convert('RGB')
+        image = ImageOps.invert(image)
+    if 'grayscale' in filters:
+        image = image.convert('L').convert('RGB')
+    if 'sepia' in filters:
+        if image.mode != 'RGB': image = image.convert('RGB')
+        sepia = Image.new("RGB", image.size)
+        pixels = image.load()
+        for y in range(image.height):
+            for x in range(image.width):
+                r, g, b = pixels[x, y]
+                tr = int(0.393 * r + 0.769 * g + 0.189 * b)
+                tg = int(0.349 * r + 0.686 * g + 0.168 * b)
+                tb = int(0.272 * r + 0.534 * g + 0.131 * b)
+                sepia.putpixel((x, y), (min(255, tr), min(255, tg), min(255, tb)))
+        image = sepia
+    return image
+
+@app.route('/sterge/<filename>')
+def sterge(filename):
+    path = os.path.join(UPLOAD_FOLDER, filename)
+    if os.path.exists(path):
+        os.remove(path)  # Ștergerea fișierului
+
+    # Ștergerea datelor asociate cu fața
+    face_data = load_face_data()
+    if filename in face_data['images']:
+        face_data['images'].remove(filename)
+
+    for person_id in list(face_data['persons']):
+        if filename in face_data['persons'][person_id]:
+            face_data['persons'][person_id].remove(filename)
+            if not face_data['persons'][person_id]:
+                del face_data['persons'][person_id]
+
+    save_face_data(face_data)
+    return redirect(url_for('galerie'))
+
+def load_face_data():
+    if os.path.exists(FACE_DATA_PATH):
+        with open(FACE_DATA_PATH, 'r') as f:
+            return json.load(f)
+    return {"encodings": [], "images": [], "persons": {}}
+
+def save_face_data(data):
+    with open(FACE_DATA_PATH, 'w') as f:
+        json.dump(data, f)
+
+def load_persoane_names():
+    if os.path.exists(NUME_PERSOANE_PATH):
+        with open(NUME_PERSOANE_PATH, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_persoane_names(data):
+    with open(NUME_PERSOANE_PATH, 'w') as f:
+        json.dump(data, f, indent=2)
+
+@app.route('/persoane', methods=['GET', 'POST'])
+def persoane():
+    grouped = group_images_by_faces(UPLOAD_FOLDER)
+    nume_persoane = load_persoane_names()
+    return render_template('persoane.html', grouped_images=grouped, nume_persoane=nume_persoane)
+
+@app.route('/actualizeaza_nume', methods=['POST'])
+def actualizeaza_nume():
+    person_id = request.form['person_id']
+    new_name = request.form['new_name']
+    nume_persoane = load_persoane_names()
+    nume_persoane[person_id] = new_name
+    save_persoane_names(nume_persoane)
+    return redirect(url_for('persoane'))
+
+def group_images_by_faces(image_folder):
+    import face_recognition
+    face_data = load_face_data()
+    known_encodings = [np.array(enc) for enc in face_data['encodings']]
+    known_images = set(face_data['images'])
+    persons = face_data['persons']
+    new_images = [f for f in os.listdir(image_folder)
+                  if f.lower().endswith('.jpg') and f not in known_images]
+
+    for filename in new_images:
+        image_path = os.path.join(image_folder, filename)
+        image = face_recognition.load_image_file(image_path)
+        encodings = face_recognition.face_encodings(image)
+
+        if not encodings:
+            continue
+
+        encoding = encodings[0]
+        matched = False
+
+        for idx, known_encoding in enumerate(known_encodings):
+            results = face_recognition.compare_faces([known_encoding], encoding, tolerance=0.5)
+            if results[0]:
+                person_id = f"Persoana_{idx + 1}"
+                persons.setdefault(person_id, []).append(filename)
+                matched = True
+                break
+
+        if not matched:
+            known_encodings.append(encoding)
+            person_id = f"Persoana_{len(known_encodings)}"
+            persons[person_id] = [filename]
+
+        face_data['images'].append(filename)
+
+    face_data['encodings'] = [enc.tolist() for enc in known_encodings]
+    face_data['persons'] = persons
+    save_face_data(face_data)
+    return persons
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
+
+//nume_persoane.json
+{
+  "Persoana_1": "Miruna",
+  "Persoana_2": "Darius",
+  "Persoana_4": "Carol"
+}
+
+//face_data.json
+{"encodings": [[-0.08929499238729477, -0.002657282166182995, -0.016457539051771164, -0.045140527188777924, -0.16317345201969147, 0.04535762965679169, 0.00546632707118988, -0.09259305894374847, 0.3281557261943817, -0.17875069379806519, 0.14491049945354462, 0.011633306741714478, -0.21191731095314026, 0.044543635100126266, -0.09812905639410019, 0.10331541299819946, -0.0983545333147049, -0.16925770044326782, -0.05597518011927605, -0.0608954057097
+.....
+833, 0.13192670047283173, 0.12109381705522537, 0.08969414234161377, 0.029098741710186005, 0.026043947786092758, -0.03933416306972504, -0.17769786715507507, -0.07366912811994553, 0.05340847745537758, -0.04796462506055832, 0.04696645960211754, -0.02016310766339302]], "images": ["captured_20250501-150738.jpg", "captured_20250505-192753.jpg", "captured_20250505-192738.jpg", "captured_20250505-194422.jpg", "captured_20250505-194533.jpg", "captured_20250505-194522.jpg", "captured_20250505-194412.jpg", "captured_20250505-192746.jpg", "captured_20250505-194626.jpg", "captured_20250505-194603.jpg", "edited_captured_20250505-194522.jpg"], "persons": {"Persoana_1": ["captured_20250505-192753.jpg", "captured_20250505-192738.jpg", "captured_20250505-194522.jpg", "captured_20250505-192746.jpg", "captured_20250505-194626.jpg", "edited_captured_20250505-194522.jpg"], "Persoana_2": ["captured_20250505-194422.jpg", "captured_20250505-194533.jpg", "captured_20250505-194412.jpg", "captured_20250505-194603.jpg"]}}
+
+//editare.html
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Editare Imagine</title>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600&display=swap" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Poppins', sans-serif;
+            background: linear-gradient(to bottom right, #1f4037, #99f2c8);
+            color: #fff;
+            margin: 0;
+            padding: 40px 20px;
+            text-align: center;
+        }
+
+        h1 {
+            font-weight: 600;
+            margin-bottom: 30px;
+        }
+
+        #image {
+            max-width: 85%;
+            max-height: 500px;
+            margin: 20px 0;
+            border-radius: 12px;
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+            transition: filter 0.3s ease;
+        }
+
+        .filter-buttons {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 15px;
+            margin: 30px 0;
+        }
+
+        .filter-buttons button {
+            padding: 10px 18px;
+            font-size: 15px;
+            background-color: #00796b;
+            color: white;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+
+        .filter-buttons button.active {
+            background-color: #4CAF50;
+        }
+
+        .filter-buttons button:hover {
+            background-color: #004d40;
+        }
+
+        .button-container {
+            margin-top: 20px;
+        }
+
+        .button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 12px 30px;
+            border: none;
+            border-radius: 30px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+            font-size: 16px;
+        }
+
+        .button:hover {
+            background-color: #388e3c;
+        }
+
+        .footer {
+            margin-top: 50px;
+            color: #e0e0e0;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>Editare Imagine</h1>
+    <img id="image" src="{{ url_for('serve_image', filename=filename) }}" alt="Imagine de editat">
+
+    <form id="editForm" method="POST" action="{{ url_for('editeaza', filename=filename) }}" enctype="multipart/form-data">
+        <div class="filter-buttons">
+            <button type="button" class="toggle-filter" data-filter="brightness">Luminozitate</button>
+            <button type="button" class="toggle-filter" data-filter="contrast">Contrast</button>
+            <button type="button" class="toggle-filter" data-filter="saturation">Saturație</button>
+            <button type="button" class="toggle-filter" data-filter="blur">Blur</button>
+            <button type="button" class="toggle-filter" data-filter="invert">Inversare</button>
+            <button type="button" class="toggle-filter" data-filter="grayscale">Alb-Negru</button>
+            <button type="button" class="toggle-filter" data-filter="sepia">Sepia</button>
+        </div>
+
+        <div class="button-container">
+            <button type="submit" class="button">💾 Salvează Imaginea</button>
+        </div>
+
+        <input type="hidden" name="image" id="imageData">
+        <input type="hidden" name="filters" id="filters">
+    </form>
+
+    <script>
+        const image = document.getElementById("image");
+        const filterButtons = document.querySelectorAll(".toggle-filter");
+        const activeFilters = new Set();
+
+        const filterMap = {
+            brightness: "brightness(1.4)",
+            contrast: "contrast(1.4)",
+            saturation: "saturate(1.4)",
+            blur: "blur(5px)",
+            sharpen: "", // se aplică doar server-side
+            invert: "invert(100%)",
+            grayscale: "grayscale(100%)",
+            sepia: "sepia(100%)"
+        };
+
+        function updateImageStyle() {
+            let appliedCSSFilters = [];
+
+            activeFilters.forEach(f => {
+                if (filterMap[f]) {
+                    appliedCSSFilters.push(filterMap[f]);
+                }
+            });
+
+            image.style.filter = appliedCSSFilters.join(" ");
+        }
+
+        filterButtons.forEach(button => {
+            button.addEventListener("click", () => {
+                const filter = button.getAttribute("data-filter");
+
+                if (activeFilters.has(filter)) {
+                    activeFilters.delete(filter);
+                    button.classList.remove("active");
+                } else {
+                    activeFilters.add(filter);
+                    button.classList.add("active");
+                }
+
+                updateImageStyle();
+            });
+        });
+
+        document.getElementById('editForm').addEventListener('submit', function(event) {
+            event.preventDefault();
+
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            const maxWidth = 800;
+            const scale = maxWidth / image.naturalWidth;
+            const newWidth = maxWidth;
+            const newHeight = image.naturalHeight * scale;
+
+            canvas.width = newWidth;
+            canvas.height = newHeight;
+            ctx.drawImage(image, 0, 0, newWidth, newHeight);
+
+            const imageData = canvas.toDataURL('image/jpeg', 0.7);
+            document.getElementById('imageData').value = imageData;
+            document.getElementById('filters').value = Array.from(activeFilters).join(',');
+
+            this.submit();
+        });
+    </script>
+</body>
+</html>
+
+//galerie.html
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+    <meta charset="UTF-8">
+    <title>Galerie Pi</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background: linear-gradient(to bottom, #0f2027, #203a43, #2c5364);
+            color: white;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        .navbar {
+            background-color: #111;
+        }
+
+        .navbar .nav-link,
+        .navbar .navbar-brand {
+            color: #fff;
+            transition: color 0.3s;
+        }
+
+        .navbar .nav-link:hover,
+        .navbar .navbar-brand:hover {
+            color: #00bcd4;
+        }
+
+        .card {
+            background-color: rgba(255, 255, 255, 0.05);
+            border: none;
+            border-radius: 15px;
+            overflow: hidden;
+            transition: box-shadow 0.3s;
+        }
+
+        .card:hover {
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+        }
+
+        .gallery-img,
+        .gallery-video {
+            object-fit: cover;
+            width: 100%;
+            height: 250px;
+            border-bottom: 2px solid rgba(255, 255, 255, 0.1);
+            transition: box-shadow 0.3s ease;
+        }
+
+        .card-text {
+            color: #ccc;
+            font-size: 0.9rem;
+            padding-top: 10px;
+        }
+
+        .btn-primary {
+            background-color: #00bcd4;
+            border: none;
+        }
+
+        .btn-primary:hover {
+            background-color: #0097a7;
+        }
+    </style>
+</head>
+<body>
+
+<nav class="navbar navbar-expand-lg">
+    <div class="container-fluid">
+        <a class="navbar-brand" href="/">Galerie Pi</a>
+        <div class="collapse navbar-collapse">
+            <ul class="navbar-nav ms-auto">
+                <li class="nav-item">
+                    <a class="nav-link" href="/">Acasă</a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link" href="/galerie">Galerie</a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link" href="/persoane">Persoane</a>
+                </li>
+            </ul>
+        </div>
+    </div>
+</nav>
+
+<div class="container mt-4">
+    <h2 class="mb-4 text-center">Imagini și Video Capturate</h2>
+    <div class="text-center mb-4">
+        <a href="{{ url_for('persoane') }}" class="btn btn-primary">Grupează după persoane</a>
+    </div>
+    <div class="row g-4">
+        {% for media in media_files %}
+        <div class="col-md-4">
+            <div class="card gallery-card">
+                {% if media.lower().endswith(('.jpg', '.jpeg', '.png', '.gif')) %}
+                <!-- Pentru imagini -->
+                <img src="{{ url_for('serve_image', filename=media) }}"
+                     class="gallery-img"
+                     alt="{{ media }}"
+                     onclick="openEditModal('{{ url_for('serve_image', filename=media) }}', '{{ media }}')">
+                {% elif media.lower().endswith(('.mp4', '.mov', '.avi')) %}
+                <!-- Pentru videoclipuri -->
+                <video class="gallery-video" onclick="openVideoModal('{{ url_for('serve_image', filename=media) }}')">
+                    <source src="{{ url_for('serve_image', filename=media) }}" type="video/mp4">
+                    Browserul tău nu suportă eticheta video.
+                </video>
+                {% endif %}
+                <div class="card-body text-center">
+                    <p class="card-text">{{ media }}</p>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+
+<!-- Modal pentru Editare Imagine -->
+<div class="modal fade" id="editModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content bg-dark text-white">
+      <div class="modal-header">
+        <h5 class="modal-title" id="editModalFilename"></h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body text-center">
+        <img id="editModalImage" src="" class="img-fluid" style="max-height:80vh;">
+      </div>
+      <div class="modal-footer">
+        <a id="editBtn" class="btn btn-warning" href="#">Editează</a>
+        <a id="deleteBtn" class="btn btn-danger" href="#">Șterge</a>
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Închide</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Modal pentru Video -->
+<div class="modal fade" id="videoModal" tabindex="-1">
+  <div class="modal-dialog modal-fullscreen">
+    <div class="modal-content bg-dark text-white">
+      <div class="modal-header">
+        <h5 class="modal-title" id="videoModalFilename"></h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body text-center">
+        <video id="videoModalVideo" controls autoplay class="img-fluid" style="max-height:80vh;">
+            <source id="videoModalSource" src="" type="video/mp4">
+            Browserul tău nu suportă eticheta video.
+        </video>
+      </div>
+      <div class="modal-footer">
+        <a id="deleteVideoBtn" class="btn btn-danger" href="#">Șterge</a>
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Închide</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+
+<script>
+  const editModal = new bootstrap.Modal(document.getElementById('editModal'));
+  const videoModal = new bootstrap.Modal(document.getElementById('videoModal'));
+
+  function openEditModal(mediaSrc, filename) {
+    document.getElementById('editModalImage').src = mediaSrc;
+    document.getElementById('editModalFilename').innerText = filename;
+    document.getElementById('editBtn').href = '/editeaza/' + filename;
+    document.getElementById('deleteBtn').href = '/sterge/' + filename;
+    editModal.show();
+  }
+
+  function openVideoModal(mediaSrc) {
+    document.getElementById('videoModalSource').src = mediaSrc;
+    document.getElementById('videoModalVideo').load();
+    const filename = mediaSrc.split('/').pop();  // Extrage numele fișierului
+    document.getElementById('videoModalFilename').innerText = filename;
+    document.getElementById('deleteVideoBtn').href = '/sterge/' + filename;  // Ruta pentru ștergere
+    videoModal.show();
+  }
+
+</script>
+
+</body>
+</html>
+
+//index.html
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Galerie Pi - Acasă</title>
+    <!-- Link pentru fonturi Google -->
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600&display=swap" rel="stylesheet">
+    <!-- Bootstrap pentru stiluri rapide -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        /* Stiluri generale */
+        body {
+            font-family: 'Poppins', sans-serif;
+            background: linear-gradient(to right, #00c6ff, #0072ff);
+            margin: 0;
+            padding: 0;
+            color: white;
+        }
+
+        /* Header */
+        .header {
+            text-align: center;
+            margin-top: 150px;
+        }
+
+        .header h1 {
+            font-size: 3.5rem;
+            font-weight: 600;
+            color: white;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+        }
+
+        .header p {
+            font-size: 1.25rem;
+            color: #d1d1d1;
+            margin-top: 20px;
+        }
+
+        /* Butonul principal */
+        .main-btn {
+            font-size: 1.2rem;
+            padding: 12px 30px;
+            background-color: #ff5c8d;
+            border: none;
+            border-radius: 30px;
+            color: white;
+            text-decoration: none;
+            margin-top: 30px;
+            display: inline-block;
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+            transition: background-color 0.3s, transform 0.3s;
+        }
+
+        .main-btn:hover {
+            background-color: #ff2e63;
+            transform: scale(1.05);
+        }
+
+        /* Footer */
+        .footer {
+            position: absolute;
+            bottom: 10px;
+            width: 100%;
+            text-align: center;
+            font-size: 0.9rem;
+            color: #d1d1d1;
+        }
+
+        /* Box pentru butoane multiple */
+        .box {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin-top: 50px;
+        }
+
+        .box a {
+            padding: 15px 30px;
+            background-color: #4caf50;
+            color: white;
+            border-radius: 25px;
+            text-decoration: none;
+            font-size: 1.1rem;
+            transition: background-color 0.3s, transform 0.3s;
+            display: inline-block;
+        }
+
+        .box a:hover {
+            background-color: #388e3c;
+            transform: scale(1.05);
+        }
+
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Galeria Foto Raspberry Pi</h1>
+        <p>Gestionează ușor și rapid galeria foto capturată de Raspberry Pi</p>
+
+        <!-- Butonul principal pentru navigare -->
+        <a href="/galerie" class="main-btn">Vezi Galeria</a>
+    </div>
+
+    <!-- Script Bootstrap pentru funcționalitate -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+
+//persoane.html
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+    <meta charset="UTF-8">
+    <title>Imagini Grupate după Persoană</title>
+
+    <!-- Include Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+
+    <style>
+        body {
+            background: linear-gradient(to bottom, #0f2027, #203a43, #2c5364);
+            color: white;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        .navbar {
+            background-color: #111;
+        }
+
+        .navbar .nav-link,
+        .navbar .navbar-brand {
+            color: #fff;
+            transition: color 0.3s;
+        }
+
+        .navbar .nav-link:hover,
+        .navbar .navbar-brand:hover {
+            color: #00bcd4;
+        }
+
+        .grup {
+            background-color: rgba(255, 255, 255, 0.05);
+            padding: 20px;
+            border-radius: 15px;
+            margin-bottom: 40px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+        }
+
+        .grup h2 {
+            margin-bottom: 15px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+            padding-bottom: 10px;
+        }
+
+        .imagine {
+            display: inline-block;
+            margin: 10px;
+        }
+
+        .imagine img {
+            width: 200px;
+            height: 200px;
+            object-fit: cover;
+            border-radius: 12px;
+            border: 2px solid rgba(255, 255, 255, 0.1);
+            transition: box-shadow 0.3s ease;
+        }
+
+        .imagine img:hover {
+            box-shadow: 0 4px 8px rgba(255, 255, 255, 0.2);
+        }
+
+        form {
+            margin-bottom: 15px;
+        }
+
+        form input[type="text"] {
+            padding: 6px 12px;
+            border: none;
+            border-radius: 8px;
+            margin-right: 10px;
+        }
+
+        form button {
+            background-color: #00bcd4;
+            border: none;
+            color: white;
+            padding: 6px 12px;
+            border-radius: 8px;
+            transition: background-color 0.3s;
+        }
+
+        form button:hover {
+            background-color: #0097a7;
+        }
+    </style>
+</head>
+<body>
+
+<nav class="navbar navbar-expand-lg">
+    <div class="container-fluid">
+        <a class="navbar-brand" href="/">Galerie Pi</a>
+        <div class="collapse navbar-collapse">
+            <ul class="navbar-nav ms-auto">
+                <li class="nav-item">
+                    <a class="nav-link" href="/">Acasă</a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link" href="/galerie">Galerie</a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link" href="/persoane">Persoane</a>
+                </li>
+            </ul>
+        </div>
+    </div>
+</nav>
+
+<div class="container mt-4">
+    <h1 class="text-center mb-5">Imagini grupate după fețe</h1>
+
+    <!-- Buton Înapoi -->
+    <div class="text-center mb-4">
+        <a href="{{ url_for('galerie') }}" class="btn btn-secondary">Înapoi la galerie</a>
+    </div>
+
+    {% for person_id, images in grouped_images.items() %}
+        <div class="grup">
+            <h2>{{ nume_persoane.get(person_id, person_id) }}</h2>
+
+            <form method="POST" action="{{ url_for('actualizeaza_nume') }}" class="d-flex flex-wrap align-items-center">
+                <input type="hidden" name="person_id" value="{{ person_id }}">
+                <input type="text" name="new_name" placeholder="Nume nou" required>
+                <button type="submit">Salvează numele</button>
+            </form>
+
+            <div class="d-flex flex-wrap">
+                {% for image in images %}
+                    <div class="imagine">
+                        <img src="{{ url_for('serve_image', filename=image) }}" alt="{{ image }}">
+                    </div>
+                {% endfor %}
+            </div>
+        </div>
+    {% endfor %}
+</div>
+
+<!-- Include Bootstrap JS -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+
+</body>
+</html>
